@@ -6,8 +6,8 @@
 
 struct Config {
     struct in_addr c2_ip;
-    unsigned int minimum_poll_seconds;
-    unsigned int maximum_poll_seconds;
+    int minimum_poll_seconds;
+    int maximum_poll_seconds;
     int compression_level;
 };
 
@@ -20,11 +20,16 @@ int main(void) {
     };
 
     inet_pton(AF_INET, "192.168.67.20", &configuration.c2_ip);
-    srand((unsigned int)time(NULL) ^ (unsigned int)getpid());
+    srand((int)time(NULL) ^ (int)getpid());
 
     for (int i = configuration.minimum_poll_seconds; i <= configuration.maximum_poll_seconds; i++) {
 
-        unsigned int delay_before_next_poll = configuration.minimum_poll_seconds + (int)rand() % (configuration.maximum_poll_seconds - configuration.minimum_poll_seconds + 1);
+        int delay_before_next_poll = configuration.minimum_poll_seconds + (int)rand() % (configuration.maximum_poll_seconds - configuration.minimum_poll_seconds + 1);
+
+
+
+
+
         sleep(delay_before_next_poll);
 
     }
