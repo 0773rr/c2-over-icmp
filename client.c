@@ -45,7 +45,7 @@ uint64_t get_device_id(){
 
 		FILE *file = fopen(paths[i], "r");
 		if (file == NULL) {
-			return 1;
+			continue;
 		}
 
 		int character;
@@ -90,6 +90,9 @@ uint16_t calculate_checksum(const unsigned char *data, size_t length) {
 ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, const unsigned char *data_to_send, size_t data_to_send_length, unsigned char *received_data) {
 
 	int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	if (fd < 0) {
+		return -1;
+	}
 
 	struct sockaddr_in destination = {0};
 	destination.sin_family = AF_INET;
@@ -102,12 +105,16 @@ ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, cons
 	request[5] = (unsigned char)identifier;
 	request[6] = (unsigned char)(sequence >> 8);
 	request[7] = (unsigned char)sequence;
+	if (data_to_send_length > MAX_PAYLOAD_SIZE) {
+		close(fd);
+		return -1;
+	}
 	memcpy(request + 8, data_to_send, data_to_send_length);
-	uint16_t checksum = calculate_checksum(request, sizeof(request) + data_to_send_length);
+	uint16_t checksum = calculate_checksum(request, 8 + data_to_send_length);
 	request[2] = (unsigned char)(checksum >> 8);
 	request[3] = (unsigned char)checksum;
 
-	sendto(fd, request, sizeof(request) + data_to_send_length, 0, (struct sockaddr *)&destination, sizeof(destination));
+	sendto(fd, request, 8 + data_to_send_length, 0, (struct sockaddr *)&destination, sizeof(destination));
 
 
 	struct pollfd waiting_socket = {
@@ -131,7 +138,7 @@ ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, cons
 		socklen_t sender_length = sizeof(sender);
 		size_t response_length = recvfrom(fd, response, sizeof(response), 0, (struct sockaddr *)&sender, &sender_length);
 		size_t ip_header_length = (response[0] & 0x0f) * 4;
-		if (response_length < 28 || (response[0] >> 4) != 4 || ip_header_length < 20 || response_length < ip_header_length + 8) {
+		if (response_length < ip_header_length + 8) {
 			continue;
 		}
 		unsigned char *reply = response + ip_header_length;
@@ -213,6 +220,59 @@ unsigned char *compress_encrypt(const unsigned char *message, size_t message_len
 
 }
 
+unsigned char *decrypt_uncompress(const unsigned char *received_data, size_t received_data_length, size_t *received_message_length) {
+
+	unsigned char nonce[12];
+	unsigned char authentication_tag[16];
+
+	if (received_data_length < sizeof(nonce) + sizeof(authentication_tag)) {
+		*received_message_length = 0;
+		return NULL;
+	}
+
+	memcpy(nonce, received_data, sizeof(nonce));
+	memcpy(authentication_tag, received_data + sizeof(nonce), sizeof(authentication_tag));
+
+	int encrypted_length = (int)(received_data_length - sizeof(nonce) - sizeof(authentication_tag));
+	unsigned char *decrypted_data = malloc((size_t)encrypted_length);
+	EVP_CIPHER_CTX *decryption_context = EVP_CIPHER_CTX_new();
+	int decrypted_length = 0;
+	int final_decrypted_length = 0;
+	EVP_DecryptInit_ex(decryption_context, EVP_aes_256_gcm(), NULL, ENCRYPTION_KEY, nonce);
+	EVP_DecryptUpdate(decryption_context, decrypted_data, &decrypted_length, received_data + sizeof(nonce) + sizeof(authentication_tag), encrypted_length);
+	EVP_CIPHER_CTX_ctrl(decryption_context, EVP_CTRL_AEAD_SET_TAG, sizeof(authentication_tag), authentication_tag);
+	if (EVP_DecryptFinal_ex(decryption_context, decrypted_data + decrypted_length, &final_decrypted_length) <= 0) {
+		EVP_CIPHER_CTX_free(decryption_context);
+		free(decrypted_data);
+		*received_message_length = 0;
+		return NULL;
+	}
+	EVP_CIPHER_CTX_free(decryption_context);
+	decrypted_length += final_decrypted_length;
+
+	uLongf uncompressed_capacity = 4096;
+	unsigned char *uncompressed_data = malloc(uncompressed_capacity);
+	uLongf uncompressed_length = uncompressed_capacity;
+	int status = uncompress(uncompressed_data, &uncompressed_length, decrypted_data, (uLong)decrypted_length);
+	while (status == Z_BUF_ERROR) {
+		uncompressed_capacity *= 2;
+		uncompressed_data = realloc(uncompressed_data, uncompressed_capacity);
+		uncompressed_length = uncompressed_capacity;
+		status = uncompress(uncompressed_data, &uncompressed_length, decrypted_data, (uLong)decrypted_length);
+	}
+
+	free(decrypted_data);
+
+	if (status != Z_OK) {
+		free(uncompressed_data);
+		*received_message_length = 0;
+		return NULL;
+	}
+
+	*received_message_length = uncompressed_length;
+	return uncompressed_data;
+
+}
 
 
 
@@ -236,11 +296,11 @@ int main() {
 	unsigned char *data_to_send = compress_encrypt((const unsigned char *)message, strlen(message), configuration.compression_level, &data_to_send_length);
 
 
-	size_t received_data_length = 0;
-	unsigned char *received_data = ;
+	size_t received_message_length = 0;
+	unsigned char *received_message = decrypt_uncompress(data_to_send, data_to_send_length, &received_message_length);
 
 	free(data_to_send);
-	free(received_data);
+	free(received_message);
 
 	return 0;
 }
