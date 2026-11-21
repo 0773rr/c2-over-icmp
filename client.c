@@ -4,6 +4,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <endian.h>
 #include <zlib.h>
 #include <stdint.h>
 #include <inttypes.h>
@@ -271,6 +272,45 @@ unsigned char *decrypt_uncompress(const unsigned char *received_data, size_t rec
 
 	*received_message_length = uncompressed_length;
 	return uncompressed_data;
+
+}
+
+unsigned char *build_message(uint8_t message_type, uint64_t device_id, const unsigned char *message_body, size_t message_body_length, size_t *message_length) {
+
+	size_t result_length = 1 + sizeof(device_id) + message_body_length;
+	unsigned char *message = malloc(result_length);
+
+	message[0] = message_type;
+	uint64_t network_device_id = htobe64(device_id);
+	memcpy(message + 1, &network_device_id, sizeof(network_device_id));
+
+	if (message_body_length > 0) {
+		memcpy(message + 1 + sizeof(network_device_id), message_body, message_body_length);
+	}
+
+	*message_length = result_length;
+	return message;
+
+}
+
+int parse_message(const unsigned char *received_message, size_t received_message_length, uint8_t *received_message_type, uint64_t *device_id, unsigned char **received_message_body, size_t *received_message_body_length) {
+
+	if (received_message_length < 1 + sizeof(uint64_t)) {
+		return -1;
+	}
+
+	*received_message_type = received_message[0];
+
+	uint64_t network_device_id;
+	memcpy(&network_device_id, received_message + 1, sizeof(network_device_id));
+	*device_id = be64toh(network_device_id);
+
+	*received_message_body_length = received_message_length - 1 - sizeof(uint64_t);
+	*received_message_body = malloc(*received_message_body_length + 1);
+	memcpy(*received_message_body, received_message + 1 + sizeof(uint64_t), *received_message_body_length);
+	(*received_message_body)[*received_message_body_length] = 0;
+
+	return 0;
 
 }
 
