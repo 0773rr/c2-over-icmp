@@ -186,6 +186,123 @@ int parse_message(const unsigned char *received_message, size_t received_message
 
 }
 
+struct IncomingTransfer {
+	uint32_t transfer_id;
+	uint32_t total_amount_of_chunks;
+	uint32_t received_chunks;
+	size_t task_output_length;
+	uint32_t *chunk_checksums;
+	unsigned char *task_output;
+};
+
+struct Task {
+	struct Task *next_task;
+	unsigned char *command;
+	size_t command_length;
+};
+
+struct TaskResult {
+	struct TaskResult *next_result;
+	unsigned char *task_output;
+	size_t task_output_length;
+};
+
+struct Client {
+	struct Client *next_client;
+	uint64_t device_id;
+	time_t last_seen;
+	struct IncomingTransfer *incoming_transfer;
+	struct Task *first_task;
+	struct Task *last_task;
+	struct TaskResult *first_result;
+	struct TaskResult *last_result;
+};
+
+struct Client *first_client = NULL;
+
+struct Client *find_client(uint64_t device_id) {
+
+	for (struct Client *client = first_client; client != NULL; client = client->next_client) {
+		if (client->device_id == device_id) {
+			return client;
+		}
+	}
+
+	return NULL;
+
+}
+
+struct Client *register_client(uint64_t device_id) {
+
+	struct Client *client = find_client(device_id);
+	if (client != NULL) {
+		client->last_seen = time(NULL);
+		return client;
+	}
+
+	client = malloc(sizeof(struct Client));
+	client->device_id = device_id;
+	client->last_seen = time(NULL);
+	client->incoming_transfer = NULL;
+	client->first_task = NULL;
+	client->last_task = NULL;
+	client->first_result = NULL;
+	client->last_result = NULL;
+	client->next_client = first_client;
+	first_client = client;
+
+	return client;
+
+}
+
+void add_task(struct Client *client, unsigned char *command, size_t command_length) {
+
+	struct Task *task = malloc(sizeof(struct Task));
+	task->next_task = NULL;
+	task->command = command;
+	task->command_length = command_length;
+
+	if (client->last_task == NULL) {
+		client->first_task = task;
+	} else {
+		client->last_task->next_task = task;
+	}
+	client->last_task = task;
+
+}
+
+struct Task *move_to_next_task(struct Client *client) {
+
+	struct Task *task = client->first_task;
+	if (task == NULL) {
+		return NULL;
+	}
+
+	client->first_task = task->next_task;
+	if (client->first_task == NULL) {
+		client->last_task = NULL;
+	}
+
+	return task;
+
+}
+
+void add_task_result(struct Client *client, unsigned char *task_output, size_t task_output_length) {
+
+	struct TaskResult *result = malloc(sizeof(struct TaskResult));
+	result->next_result = NULL;
+	result->task_output = task_output;
+	result->task_output_length = task_output_length;
+
+	if (client->last_result == NULL) {
+		client->first_result = result;
+	} else {
+		client->last_result->next_result = result;
+	}
+	client->last_result = result;
+
+}
+
 int main(){
 	return 0;
 }
