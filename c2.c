@@ -97,7 +97,6 @@ unsigned char *decrypt_uncompress(const unsigned char *received_data, size_t rec
 
 	unsigned char nonce[12];
 	unsigned char authentication_tag[16];
-
 	if (received_data_length < sizeof(nonce) + sizeof(authentication_tag)) {
 		*received_message_length = 0;
 		return NULL;
@@ -135,7 +134,6 @@ unsigned char *decrypt_uncompress(const unsigned char *received_data, size_t rec
 	}
 
 	free(decrypted_data);
-
 	if (status != Z_OK) {
 		free(uncompressed_data);
 		*received_message_length = 0;
@@ -189,10 +187,10 @@ int parse_message(const unsigned char *received_message, size_t received_message
 struct IncomingTransfer {
 	uint32_t transfer_id;
 	uint32_t total_amount_of_chunks;
-	uint32_t received_chunks;
+	uint32_t next_chunk_index;
 	size_t task_output_length;
-	uint32_t *chunk_checksums;
 	unsigned char *task_output;
+	uint32_t *chunk_checksums;
 };
 
 struct Task {
@@ -218,7 +216,7 @@ struct Client {
 	struct TaskResult *last_result;
 };
 
-struct Client *first_client = NULL;
+static struct Client *first_client = NULL;
 
 struct Client *find_client(uint64_t device_id) {
 
@@ -303,6 +301,128 @@ void add_task_result(struct Client *client, unsigned char *task_output, size_t t
 
 }
 
-int main(){
+int handle_chunked_transfer_announcement(struct Client *client, const unsigned char *announcement_body, size_t announcement_body_length) {
+
+	if (announcement_body_length < 12) {
+		return -1;
+	}
+
+	uint32_t network_byte_order;
+	memcpy(&network_byte_order, announcement_body, sizeof(network_byte_order));
+	uint32_t transfer_id = be32toh(network_byte_order);
+	memcpy(&network_byte_order, announcement_body + 4, sizeof(network_byte_order));
+	uint32_t total_amount_of_chunks = be32toh(network_byte_order);
+	memcpy(&network_byte_order, announcement_body + 8, sizeof(network_byte_order));
+	uint32_t announced_output_length = be32toh(network_byte_order);
+	if (announcement_body_length != 12 + (size_t)total_amount_of_chunks * 4) {
+		return -1;
+	}
+
+	size_t expected_amount_of_chunks = ((size_t)announced_output_length + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE;
+	if (expected_amount_of_chunks == 0) {
+		expected_amount_of_chunks = 1;
+	}
+	if ((size_t)total_amount_of_chunks != expected_amount_of_chunks) {
+		return -1;
+	}
+
+	if (client->incoming_transfer != NULL) {
+		free(client->incoming_transfer->task_output);
+		free(client->incoming_transfer->chunk_checksums);
+		free(client->incoming_transfer);
+		client->incoming_transfer = NULL;
+	}
+
+	struct IncomingTransfer *incoming_transfer = malloc(sizeof(struct IncomingTransfer));
+	incoming_transfer->transfer_id = transfer_id;
+	incoming_transfer->total_amount_of_chunks = total_amount_of_chunks;
+	incoming_transfer->next_chunk_index = 0;
+	incoming_transfer->task_output_length = announced_output_length;
+	incoming_transfer->task_output = malloc((size_t)announced_output_length + 1);
+	incoming_transfer->chunk_checksums = malloc((size_t)total_amount_of_chunks * sizeof(uint32_t));
+
+	for (uint32_t i = 0; i < total_amount_of_chunks; i++) {
+		memcpy(&network_byte_order, announcement_body + 12 + (size_t)i * 4, sizeof(network_byte_order));
+		incoming_transfer->chunk_checksums[i] = be32toh(network_byte_order);
+	}
+
+	client->incoming_transfer = incoming_transfer;
+
+	return 0;
+
+}
+
+unsigned char *build_ack(uint32_t transfer_id, uint32_t chunk_index, size_t *ack_body_length) {
+
+	unsigned char *ack_body = malloc(8);
+
+	uint32_t network_byte_order = htobe32(transfer_id);
+	memcpy(ack_body, &network_byte_order, sizeof(network_byte_order));
+	network_byte_order = htobe32(chunk_index);
+	memcpy(ack_body + 4, &network_byte_order, sizeof(network_byte_order));
+
+	*ack_body_length = 8;
+	return ack_body;
+
+}
+
+int handle_chunk(struct Client *client, const unsigned char *chunk_body, size_t chunk_body_length, unsigned char **ack_body, size_t *ack_body_length) {
+
+	if (chunk_body_length < 16) {
+		return -1;
+	}
+
+	uint32_t network_byte_order;
+	memcpy(&network_byte_order, chunk_body, sizeof(network_byte_order));
+	uint32_t transfer_id = be32toh(network_byte_order);
+	memcpy(&network_byte_order, chunk_body + 4, sizeof(network_byte_order));
+	uint32_t chunk_index = be32toh(network_byte_order);
+
+	struct IncomingTransfer *incoming_transfer = client->incoming_transfer;
+	if (incoming_transfer == NULL || incoming_transfer->transfer_id != transfer_id) {
+		return -1;
+	}
+
+	if (chunk_index >= incoming_transfer->total_amount_of_chunks) {
+		return -1;
+	}
+
+	size_t chunk_data_length = chunk_body_length - 16;
+	size_t chunk_offset = (size_t)chunk_index * MAX_CHUNK_SIZE;
+	if (chunk_data_length > MAX_CHUNK_SIZE || chunk_offset + chunk_data_length > incoming_transfer->task_output_length) {
+		return -1;
+	}
+	if ((uint32_t)crc32(0, chunk_body + 16, chunk_data_length) != incoming_transfer->chunk_checksums[chunk_index]) {
+		return -1;
+	}
+
+	if (chunk_index < incoming_transfer->next_chunk_index) {
+		*ack_body = build_ack(transfer_id, chunk_index, ack_body_length);
+		return 0;
+	}
+	if (chunk_index != incoming_transfer->next_chunk_index) {
+		return -1;
+	}
+
+	memcpy(incoming_transfer->task_output + chunk_offset, chunk_body + 16, chunk_data_length);
+	incoming_transfer->next_chunk_index++;
+
+	*ack_body = build_ack(transfer_id, chunk_index, ack_body_length);
+
+	if (incoming_transfer->next_chunk_index >= incoming_transfer->total_amount_of_chunks) {
+		add_task_result(client, incoming_transfer->task_output, incoming_transfer->task_output_length);
+		incoming_transfer->task_output = NULL;
+		free(incoming_transfer->chunk_checksums);
+		free(incoming_transfer);
+		client->incoming_transfer = NULL;
+		return 1;
+	}
+
+	return 0;
+
+}
+
+int main() {
+
 	return 0;
 }

