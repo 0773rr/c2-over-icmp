@@ -438,6 +438,7 @@ ssize_t receive_echo_request(int fd, unsigned char *received_request_data, struc
 		return -1;
 	}
 
+
 	unsigned char *echo_request = request + ip_header_length;
 	if (echo_request[0] != ICMP_ECHO || echo_request[1] != 0 || calculate_checksum(echo_request, request_length - ip_header_length) != 0) {
 		return -1;
@@ -536,6 +537,101 @@ unsigned char *handle_client_message(const unsigned char *received_request_data,
 	free(received_message_body);
 
 	return reply_message;
+
+}
+
+int create_http_listener(uint16_t port) {
+
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		return -1;
+	}
+
+	const int reuse_address = 1;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse_address, sizeof(reuse_address));
+
+	struct sockaddr_in address = {0};
+	address.sin_family = AF_INET;
+	address.sin_addr.s_addr = htonl(INADDR_ANY);
+	address.sin_port = htons(port);
+	if (bind(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	return fd;
+
+}
+
+struct HttpRequest {
+	char method[8];
+	char path[512];
+	unsigned char *body;
+	size_t body_length;
+};
+
+int receive_http_request(int listener_fd, struct HttpRequest *received_request) {
+
+	int connection_fd = accept(listener_fd, NULL, NULL);
+	if (connection_fd < 0) {
+		return -1;
+	}
+
+	unsigned char request[4096];
+	size_t request_length = 0;
+	ssize_t header_end = -1;
+	while (request_length < sizeof(request)) {
+		ssize_t received_length = recv(connection_fd, request + request_length, sizeof(request) - request_length, 0);
+		if (received_length <= 0) {
+			close(connection_fd);
+			return -1;
+		}
+		request_length += (size_t)received_length;
+		for (size_t i = 0; i + 4 <= request_length; i++) {
+			if (request[i] == '\r' && request[i + 1] == '\n' && request[i + 2] == '\r' && request[i + 3] == '\n') {
+				header_end = (ssize_t)i;
+				break;
+			}
+		}
+		if (header_end >= 0) {
+			break;
+		}
+	}
+	if (header_end < 0) {
+		close(connection_fd);
+		return -1;
+	}
+
+	size_t header_length = (size_t)header_end + 4;
+	sscanf((const char *)request, "%7s %511s", received_request->method, received_request->path);
+
+	size_t content_length = 0;
+	char *content_length_header = strstr((const char *)request, "Content-Length:");
+	if (content_length_header != NULL) {
+		content_length = (size_t)strtol(content_length_header + 15, NULL, 10);
+	}
+	if (header_length + content_length > sizeof(request)) {
+		close(connection_fd);
+		return -1;
+	}
+
+	while (request_length < header_length + content_length) {
+		ssize_t received_length = recv(connection_fd, request + request_length, sizeof(request) - request_length, 0);
+		if (received_length <= 0) {
+			close(connection_fd);
+			return -1;
+		}
+		request_length += (size_t)received_length;
+	}
+
+	received_request->body_length = content_length;
+	received_request->body = malloc(content_length + 1);
+	memcpy(received_request->body, request + header_length, content_length);
+	received_request->body[content_length] = 0;
+
+	close(connection_fd);
+
+	return 0;
 
 }
 
