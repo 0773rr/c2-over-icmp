@@ -559,6 +559,11 @@ int create_http_listener(uint16_t port) {
 		return -1;
 	}
 
+	if (listen(fd, 16) < 0) {
+		close(fd);
+		return -1;
+	}
+
 	return fd;
 
 }
@@ -762,5 +767,58 @@ void handle_http_request(int listener_fd) {
 
 int main() {
 
+	int icmp_fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	if (icmp_fd < 0) {
+		return 1;
+	}
+
+	int http_fd = create_http_listener(8080);
+	if (http_fd < 0) {
+		return 1;
+	}
+
+	struct pollfd waiting_sockets[2] = {
+		{ .fd = icmp_fd, .events = POLLIN },
+		{ .fd = http_fd, .events = POLLIN }
+	};
+
+	while (1) {
+
+		poll(waiting_sockets, 2, -1);
+
+		if (waiting_sockets[0].revents & POLLIN) {
+
+			unsigned char received_request_data[2048];
+			struct in_addr sender_ip = {0};
+			uint16_t identifier = 0;
+			uint16_t sequence = 0;
+			ssize_t received_request_data_length = receive_echo_request(icmp_fd, received_request_data, &sender_ip, &identifier, &sequence);
+			if (received_request_data_length >= 0) {
+
+				size_t reply_message_length = 0;
+				unsigned char *reply_message = handle_client_message(received_request_data, (size_t)received_request_data_length, &reply_message_length);
+				if (reply_message != NULL) {
+
+					size_t data_to_send_length = 0;
+					unsigned char *data_to_send = compress_encrypt(reply_message, reply_message_length, 9, &data_to_send_length);
+					free(reply_message);
+					if (data_to_send != NULL) {
+						send_echo_reply(icmp_fd, sender_ip, identifier, sequence, data_to_send, data_to_send_length);
+					}
+					free(data_to_send);
+
+				}
+
+			}
+
+		}
+
+		if (waiting_sockets[1].revents & POLLIN) {
+			handle_http_request(http_fd);
+		}
+
+	}
+
 	return 0;
+
 }
