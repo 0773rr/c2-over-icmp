@@ -570,7 +570,7 @@ struct HttpRequest {
 	size_t body_length;
 };
 
-int receive_http_request(int listener_fd, struct HttpRequest *received_request) {
+int receive_http_request(int listener_fd, int *received_connection_fd, struct HttpRequest *received_request) {
 
 	int connection_fd = accept(listener_fd, NULL, NULL);
 	if (connection_fd < 0) {
@@ -629,9 +629,134 @@ int receive_http_request(int listener_fd, struct HttpRequest *received_request) 
 	memcpy(received_request->body, request + header_length, content_length);
 	received_request->body[content_length] = 0;
 
-	close(connection_fd);
+	*received_connection_fd = connection_fd;
 
 	return 0;
+
+}
+
+void send_http_response(int connection_fd, int status_code, const char *status_text, const unsigned char *response_body, size_t response_body_length) {
+
+	char headers[256];
+	int headers_length = sprintf(headers, "HTTP/1.1 %d %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", status_code, status_text, response_body_length);
+
+	send(connection_fd, headers, (size_t)headers_length, 0);
+	send(connection_fd, response_body, response_body_length, 0);
+
+}
+
+int parse_device_id(const char *received_path, uint64_t *device_id, const char **path) {
+
+	if (strncmp(received_path, "/clients/", 9) != 0) {
+		return -1;
+	}
+
+	char *path_end;
+	unsigned long long parsed_device_id = strtoull(received_path + 9, &path_end, 16);
+	if (path_end == received_path + 9 || *path_end != '/') {
+		return -1;
+	}
+
+	*device_id = (uint64_t)parsed_device_id;
+	*path = path_end;
+
+	return 0;
+
+}
+
+void handle_list_clients_request(int connection_fd) {
+
+	size_t capacity = 4096;
+	size_t used_bytes = 0;
+	unsigned char *response_body = malloc(capacity);
+
+	char line[128];
+	size_t line_length;
+	for (struct Client *client = first_client; client != NULL; client = client->next_client) {
+		line_length = (size_t)sprintf(line, "%016" PRIx64 " %ld %ld\n", client->device_id, (long)client->last_seen, (long)(time(NULL) - client->last_seen));
+		while (used_bytes + line_length > capacity) {
+			capacity *= 2;
+			response_body = realloc(response_body, capacity);
+		}
+		memcpy(response_body + used_bytes, line, line_length);
+		used_bytes += line_length;
+	}
+
+	send_http_response(connection_fd, 200, "OK", response_body, used_bytes);
+
+	free(response_body);
+
+}
+
+void handle_create_task_request(int connection_fd, uint64_t device_id, struct HttpRequest *received_request) {
+
+	struct Client *client = find_client(device_id);
+	if (client == NULL) {
+		send_http_response(connection_fd, 404, "Not Found", (const unsigned char *)"client not registered\n", sizeof("client not registered\n") - 1);
+		free(received_request->body);
+		return;
+	}
+
+	add_task(client, received_request->body, received_request->body_length);
+	received_request->body = NULL;
+
+	send_http_response(connection_fd, 200, "OK", (const unsigned char *)"ok\n", sizeof("ok\n") - 1);
+
+}
+
+void handle_list_task_results_request(int connection_fd, uint64_t device_id) {
+
+	struct Client *client = find_client(device_id);
+	if (client == NULL) {
+		send_http_response(connection_fd, 404, "Not Found", (const unsigned char *)"client not registered\n", sizeof("client not registered\n") - 1);
+		return;
+	}
+
+	size_t capacity = 4096;
+	size_t used_bytes = 0;
+	unsigned char *response_body = malloc(capacity);
+
+	for (struct TaskResult *result = client->first_result; result != NULL; result = result->next_result) {
+		while (used_bytes + sizeof("----\n") - 1 + result->task_output_length > capacity) {
+			capacity *= 2;
+			response_body = realloc(response_body, capacity);
+		}
+		memcpy(response_body + used_bytes, "----\n", sizeof("----\n") - 1);
+		memcpy(response_body + used_bytes + sizeof("----\n") - 1, result->task_output, result->task_output_length);
+		used_bytes += sizeof("----\n") - 1 + result->task_output_length;
+	}
+
+	send_http_response(connection_fd, 200, "OK", response_body, used_bytes);
+
+	free(response_body);
+
+}
+
+void handle_http_request(int listener_fd) {
+
+	int connection_fd = -1;
+	struct HttpRequest received_request;
+	if (receive_http_request(listener_fd, &connection_fd, &received_request) != 0) {
+		return;
+	}
+
+	uint64_t device_id = 0;
+	const char *path = NULL;
+	int device_id_parsed = parse_device_id(received_request.path, &device_id, &path);
+
+	if (strcmp(received_request.method, "GET") == 0 && strcmp(received_request.path, "/clients") == 0) {
+		handle_list_clients_request(connection_fd);
+	} else if (strcmp(received_request.method, "POST") == 0 && device_id_parsed == 0 && strcmp(path, "/task") == 0) {
+		handle_create_task_request(connection_fd, device_id, &received_request);
+	} else if (strcmp(received_request.method, "GET") == 0 && device_id_parsed == 0 && strcmp(path, "/results") == 0) {
+		handle_list_task_results_request(connection_fd, device_id);
+	} else {
+		send_http_response(connection_fd, 404, "Not Found", (const unsigned char *)"not found\n", sizeof("not found\n") - 1);
+	}
+
+	free(received_request.body);
+
+	close(connection_fd);
 
 }
 
