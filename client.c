@@ -345,7 +345,6 @@ struct ChunkedTransfer {
 	int announcement_confirmed;
 	size_t task_output_length;
 	unsigned char *task_output;
-	uint32_t *chunk_checksums;
 };
 
 struct ChunkedTransfer *start_chunked_transfer(unsigned char *task_output, size_t task_output_length) {
@@ -360,16 +359,6 @@ struct ChunkedTransfer *start_chunked_transfer(unsigned char *task_output, size_
 	transfer->announcement_confirmed = 0;
 	transfer->task_output = task_output;
 	transfer->task_output_length = task_output_length;
-	transfer->chunk_checksums = malloc(transfer->total_amount_of_chunks * sizeof(uint32_t));
-
-	for (uint32_t i = 0; i < transfer->total_amount_of_chunks; i++) {
-		size_t chunk_offset = (size_t)i * MAX_CHUNK_SIZE;
-		size_t chunk_data_length = task_output_length - chunk_offset;
-		if (chunk_data_length > MAX_CHUNK_SIZE) {
-			chunk_data_length = MAX_CHUNK_SIZE;
-		}
-		transfer->chunk_checksums[i] = (uint32_t)crc32(0, task_output + chunk_offset, chunk_data_length);
-	}
 
 	return transfer;
 
@@ -377,7 +366,7 @@ struct ChunkedTransfer *start_chunked_transfer(unsigned char *task_output, size_
 
 unsigned char *build_chunked_transfer_announcement(const struct ChunkedTransfer *transfer, size_t *chunk_announcement_body_length) {
 
-	size_t body_length = 12 + (size_t)transfer->total_amount_of_chunks * 4;
+	size_t body_length = 12;
 	unsigned char *body = malloc(body_length);
 
 	uint32_t network_byte_order;
@@ -387,11 +376,6 @@ unsigned char *build_chunked_transfer_announcement(const struct ChunkedTransfer 
 	memcpy(body + 4, &network_byte_order, sizeof(network_byte_order));
 	network_byte_order = htobe32((uint32_t)transfer->task_output_length);
 	memcpy(body + 8, &network_byte_order, sizeof(network_byte_order));
-
-	for (uint32_t i = 0; i < transfer->total_amount_of_chunks; i++) {
-		network_byte_order = htobe32(transfer->chunk_checksums[i]);
-		memcpy(body + 12 + (size_t)i * 4, &network_byte_order, sizeof(network_byte_order));
-	}
 
 	*chunk_announcement_body_length = body_length;
 	return body;
@@ -421,7 +405,7 @@ unsigned char *build_chunk(const struct ChunkedTransfer *transfer, size_t *chunk
 	memcpy(body + 4, &network_byte_order, sizeof(network_byte_order));
 	network_byte_order = htobe32(transfer->total_amount_of_chunks);
 	memcpy(body + 8, &network_byte_order, sizeof(network_byte_order));
-	network_byte_order = htobe32(transfer->chunk_checksums[chunk_index]);
+	network_byte_order = htobe32((uint32_t)crc32(0, transfer->task_output + chunk_offset, chunk_data_length));
 	memcpy(body + 12, &network_byte_order, sizeof(network_byte_order));
 	memcpy(body + 16, transfer->task_output + chunk_offset, chunk_data_length);
 
@@ -448,7 +432,6 @@ int handle_ack(struct ChunkedTransfer **transfer, const unsigned char *ack_body,
 	(*transfer)->next_chunk_index++;
 	if ((*transfer)->next_chunk_index >= (*transfer)->total_amount_of_chunks) {
 		free((*transfer)->task_output);
-		free((*transfer)->chunk_checksums);
 		free(*transfer);
 		*transfer = NULL;
 		return 1;

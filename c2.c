@@ -190,7 +190,6 @@ struct IncomingTransfer {
 	uint32_t next_chunk_index;
 	size_t task_output_length;
 	unsigned char *task_output;
-	uint32_t *chunk_checksums;
 };
 
 struct Task {
@@ -303,7 +302,7 @@ void add_task_result(struct Client *client, unsigned char *task_output, size_t t
 
 int handle_chunked_transfer_announcement(struct Client *client, const unsigned char *announcement_body, size_t announcement_body_length) {
 
-	if (announcement_body_length < 12) {
+	if (announcement_body_length != 12) {
 		return -1;
 	}
 
@@ -314,9 +313,6 @@ int handle_chunked_transfer_announcement(struct Client *client, const unsigned c
 	uint32_t total_amount_of_chunks = be32toh(network_byte_order);
 	memcpy(&network_byte_order, announcement_body + 8, sizeof(network_byte_order));
 	uint32_t announced_output_length = be32toh(network_byte_order);
-	if (announcement_body_length != 12 + (size_t)total_amount_of_chunks * 4) {
-		return -1;
-	}
 
 	size_t expected_amount_of_chunks = ((size_t)announced_output_length + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE;
 	if (expected_amount_of_chunks == 0) {
@@ -328,7 +324,6 @@ int handle_chunked_transfer_announcement(struct Client *client, const unsigned c
 
 	if (client->incoming_transfer != NULL) {
 		free(client->incoming_transfer->task_output);
-		free(client->incoming_transfer->chunk_checksums);
 		free(client->incoming_transfer);
 		client->incoming_transfer = NULL;
 	}
@@ -339,12 +334,6 @@ int handle_chunked_transfer_announcement(struct Client *client, const unsigned c
 	incoming_transfer->next_chunk_index = 0;
 	incoming_transfer->task_output_length = announced_output_length;
 	incoming_transfer->task_output = malloc((size_t)announced_output_length + 1);
-	incoming_transfer->chunk_checksums = malloc((size_t)total_amount_of_chunks * sizeof(uint32_t));
-
-	for (uint32_t i = 0; i < total_amount_of_chunks; i++) {
-		memcpy(&network_byte_order, announcement_body + 12 + (size_t)i * 4, sizeof(network_byte_order));
-		incoming_transfer->chunk_checksums[i] = be32toh(network_byte_order);
-	}
 
 	client->incoming_transfer = incoming_transfer;
 
@@ -377,6 +366,8 @@ int handle_chunk(struct Client *client, const unsigned char *chunk_body, size_t 
 	uint32_t transfer_id = be32toh(network_byte_order);
 	memcpy(&network_byte_order, chunk_body + 4, sizeof(network_byte_order));
 	uint32_t chunk_index = be32toh(network_byte_order);
+	memcpy(&network_byte_order, chunk_body + 12, sizeof(network_byte_order));
+	uint32_t chunk_checksum = be32toh(network_byte_order);
 
 	struct IncomingTransfer *incoming_transfer = client->incoming_transfer;
 	if (incoming_transfer == NULL || incoming_transfer->transfer_id != transfer_id) {
@@ -392,7 +383,7 @@ int handle_chunk(struct Client *client, const unsigned char *chunk_body, size_t 
 	if (chunk_data_length > MAX_CHUNK_SIZE || chunk_offset + chunk_data_length > incoming_transfer->task_output_length) {
 		return -1;
 	}
-	if ((uint32_t)crc32(0, chunk_body + 16, chunk_data_length) != incoming_transfer->chunk_checksums[chunk_index]) {
+	if ((uint32_t)crc32(0, chunk_body + 16, chunk_data_length) != chunk_checksum) {
 		return -1;
 	}
 
@@ -412,7 +403,6 @@ int handle_chunk(struct Client *client, const unsigned char *chunk_body, size_t 
 	if (incoming_transfer->next_chunk_index >= incoming_transfer->total_amount_of_chunks) {
 		add_task_result(client, incoming_transfer->task_output, incoming_transfer->task_output_length);
 		incoming_transfer->task_output = NULL;
-		free(incoming_transfer->chunk_checksums);
 		free(incoming_transfer);
 		client->incoming_transfer = NULL;
 		return 1;
